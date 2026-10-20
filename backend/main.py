@@ -41,12 +41,13 @@ async def regla_negocio_handler(request: Request, exc: ReglaNegocioError):
 
 @app.get("/api/health")
 def health():
+    vars_ok = {v: bool(os.getenv(v)) for v in ("DATABASE_URL", "JWT_SECRET")}
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        return {"ok": True, "base_de_datos": "conectada"}
+        return {"ok": True, "base_de_datos": "conectada", "variables": vars_ok}
     except Exception as e:
-        return JSONResponse(status_code=503, content={"ok": False, "base_de_datos": "sin conexión"})
+        return JSONResponse(status_code=503, content={"ok": False, "base_de_datos": "sin conexión", "variables": vars_ok, "tipo_error": type(e).__name__})
 
 @app.exception_handler(StarletteHTTPException)
 async def http_handler(request: Request, exc: StarletteHTTPException):
@@ -99,6 +100,7 @@ def requiere(*roles: str):
 auth = APIRouter(prefix="/api", tags=["auth"])
 
 @auth.post("/auth/primer-admin", status_code=201)
+@auth.post("/auth/primer_admin", status_code=201, include_in_schema=False)
 def primer_admin(d: s.UsuarioCrear, db: Session = Depends(get_db)):
     if db.scalar(select(m.Usuario.id).limit(1)):
         raise HTTPException(403, "Ya existe un administrador")
@@ -342,7 +344,7 @@ def _pdf_certificado(d: dict, url_qr: str) -> bytes:
 
     story = []
 
-    logo_path = os.path.join("frontend", "img", "Logo-novatech-negro.png")
+    logo_path = str(Path(__file__).resolve().parent.parent / "frontend" / "img" / "logo-novatech-negro.png")
     if os.path.exists(logo_path):
         logo = Image(logo_path, width=75, height=30)
         logo.hAlign = 'LEFT'
@@ -522,16 +524,6 @@ def crear_entrega(d: s.EntregaIn, db: Session = Depends(get_db), _=ESCRIBE):
         entrega_existente.fecha_despacho = _utc_now()
         _commit(db)
         return {"ok": True, "mensaje": "Entrega actualizada exitosamente", "data": s.EntregaOut.model_validate(entrega_existente)}
-
-    entrega = m.Entrega(
-        **d.model_dump(),
-        tarifa=tarifa,
-        comision=comision,
-        fecha_despacho=_utc_now()
-    )
-    db.add(entrega)
-    _commit(db)
-    return {"ok": True, "data": s.EntregaOut.model_validate(entrega)}
 
     entrega = m.Entrega(
         **d.model_dump(),

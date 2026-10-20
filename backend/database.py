@@ -26,7 +26,18 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False
 class Base(DeclarativeBase):
     pass
 
+_tablas_listas = False
+
+def asegurar_tablas():
+    """En Vercel (serverless) el lifespan de FastAPI no es confiable:
+    creamos las tablas la primera vez que se pide una sesión."""
+    global _tablas_listas
+    if not _tablas_listas:
+        init_db()
+        _tablas_listas = True
+
 def get_db():
+    asegurar_tablas()
     db = SessionLocal()
     try:
         yield db
