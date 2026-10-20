@@ -84,7 +84,7 @@ function pintaLogin() {
   $("#login").innerHTML = `
     <div class="login-left">
       <div class="brand-header">
-        <img src="img/Logo-Novatech.png" alt="NOVATECH" style="height: 52px; object-fit: contain;">
+        <img src="img/logo-novatech.png" alt="NOVATECH" style="height: 52px; object-fit: contain;">
         <div class="brand-slogan">Innovación · Control · Eficiencia</div>
       </div>
       <div>
@@ -135,7 +135,7 @@ function pintaLogin() {
     e.preventDefault();
     const f = Object.fromEntries(new FormData(e.target));
     try {
-      if (primer) await api("/auth/primer-admin", { m: "POST", b: f });
+      if (primer) await api("/auth/primer_admin", { m: "POST", b: f });
       const r = await api("/auth/login", { m: "POST", b: f });
       token = r.token;
       sessionStorage.setItem("nt", token);
@@ -165,7 +165,7 @@ async function iniciar() {
   
   $("#side").innerHTML = `
     <div style="padding: 10px 4px; display: flex; align-items: center; justify-content: flex-start;">
-      <img src="img/Logo-Novatech.png" alt="NOVATECH" style="height: 42px; object-fit: contain;">
+      <img src="img/logo-novatech.png" alt="NOVATECH" style="height: 42px; object-fit: contain;">
     </div>
     <nav id="nav"></nav>
     <div class="side-foot">
