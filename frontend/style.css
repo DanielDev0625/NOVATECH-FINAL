@@ -316,3 +316,73 @@ aside img {
   height: 52px !important; /* Tamaño aumentado para el menú principal */
   object-fit: contain;
 }
+/* ==========================================
+   ESTILOS RESPONSIVOS PARA MOVILES (MEDIA QUERIES)
+   ========================================== */
+
+@media (max-width: 768px) {
+  /* Contenedor del Login en móviles */
+  .login-container {
+    flex-direction: column !important;
+    min-height: 100vh;
+    padding: 16px !important;
+  }
+
+  /* Ocultar o reducir el panel informativo lateral en móviles */
+  .login-left {
+    padding: 20px 12px !important;
+    text-align: center;
+  }
+
+  .login-left h1 {
+    font-size: 26px !important;
+  }
+
+  .login-features {
+    display: none !important; /* Oculta características secundarias para ahorrar espacio */
+  }
+
+  /* Formulario ajustado a pantalla completa */
+  .login-right {
+    width: 100% !important;
+    max-width: 100% !important;
+    padding: 0 !important;
+  }
+
+  .login-card {
+    padding: 20px 16px !important;
+    border-radius: 16px !important;
+  }
+
+  /* Layout principal del Dashboard */
+  .app {
+    flex-direction: column !important;
+  }
+
+  aside#side {
+    width: 100% !important;
+    height: auto !important;
+    padding: 12px !important;
+  }
+
+  .main {
+    padding: 16px !important;
+  }
+
+  /* Métrica y Tablas con scroll horizontal en celulares */
+  .metrics-grid,
+  .dashboard-grid,
+  div[style*="grid-template-columns"] {
+    grid-template-columns: 1fr !important;
+    gap: 16px !important;
+  }
+
+  .tw {
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  table {
+    min-width: 600px; /* Permite desplazamiento lateral suave en tablas grandes */
+  }
+}
