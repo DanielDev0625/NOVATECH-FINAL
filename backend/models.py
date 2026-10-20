@@ -159,6 +159,8 @@ class Lote(ModeloBase):
             raise ReglaNegocioError(f"No se puede pasar de {self.estado} a {nuevo}")
         if nuevo == "FINALIZADO" and self.control_calidad_fallido:
             raise ReglaNegocioError("No se puede finalizar: hay un control de calidad reprobado")
+        if nuevo == "FINALIZADO" and any(e.completada_en is None for e in self.etapas):
+            raise ReglaNegocioError("No se puede finalizar: hay etapas sin completar")
         self.estado = nuevo
 
 
@@ -170,6 +172,10 @@ class EtapaProduccion(ModeloBase):
     responsable: Mapped[str] = mapped_column(String(120))
     observaciones: Mapped[str | None] = mapped_column(Text)
     calidad_aprobada: Mapped[bool | None] = mapped_column(Boolean)  # None = sin control aún
+    tipo: Mapped[str] = mapped_column(String(20), default="PRODUCCION", server_default="PRODUCCION")
+    # PRODUCCION | ALMACENAMIENTO | ENTREGA
+    fecha_limite: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completada_en: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # None = pendiente
 
     lote: Mapped["Lote"] = relationship(back_populates="etapas")
 

@@ -1,4 +1,6 @@
 import os
+import re
+from io import BytesIO
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -7,12 +9,13 @@ import bcrypt
 import jwt
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session, selectinload
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import automatizacion as auto
@@ -23,12 +26,30 @@ from backend.models import ReglaNegocioError
 import secrets
 
 
+def _migrar_trazabilidad():
+    """Agrega las columnas nuevas de etapas_produccion en bases que ya existían
+    (create_all solo crea tablas nuevas). Corre una única vez: si la columna ya está, no hace nada."""
+    with engine.begin() as conn:
+        existe = conn.execute(text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'etapas_produccion' AND column_name = 'completada_en'")).first()
+        if existe:
+            return
+        conn.execute(text("ALTER TABLE etapas_produccion ADD COLUMN IF NOT EXISTS "
+                          "tipo VARCHAR(20) NOT NULL DEFAULT 'PRODUCCION'"))
+        conn.execute(text("ALTER TABLE etapas_produccion ADD COLUMN IF NOT EXISTS fecha_limite TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE etapas_produccion ADD COLUMN IF NOT EXISTS completada_en TIMESTAMPTZ"))
+        # Las etapas que ya existían eran registros de algo ya ocurrido
+        conn.execute(text("UPDATE etapas_produccion SET completada_en = fecha"))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Crea las tablas si no existen. Si la BD falla, el servidor sigue arriba
     # y /api/health informa el problema.
     try:
         init_db()
+        _migrar_trazabilidad()
         app.state.db_ok = True
     except Exception as e:
         app.state.db_ok = False
@@ -315,6 +336,294 @@ def _lote_o_404(db: Session, lote_id: int) -> m.Lote:
     return l
 
 
+# ── Trazabilidad inteligente: esquemas y ayudantes ──
+DIAS_SIN_AVANCE = int(os.getenv("TRAZ_DIAS_SIN_AVANCE", "3"))
+
+
+class EtapaPlanIn(BaseModel):
+    nombre: str = Field(min_length=2, max_length=120)
+    tipo: str = Field(default="PRODUCCION", pattern="^(PRODUCCION|ALMACENAMIENTO|ENTREGA)$")
+    responsable: str = Field(min_length=2, max_length=120)
+    observaciones: str | None = None
+    fecha_limite: datetime | None = None
+    calidad_aprobada: bool | None = None
+    fecha: datetime | None = None
+    completada: bool = True  # True = ya ocurrió (comportamiento anterior); False = etapa planificada
+
+
+class CompletarEtapaIn(BaseModel):
+    responsable: str | None = Field(default=None, min_length=2, max_length=120)
+    observaciones: str | None = None
+    calidad_aprobada: bool | None = None
+
+
+class CalidadEtapaIn(BaseModel):
+    aprobada: bool
+    observaciones: str | None = None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _aware(dt):
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _hace(delta: timedelta) -> str:
+    horas = int(delta.total_seconds() // 3600)
+    return f"{horas // 24} d {horas % 24} h" if horas >= 24 else f"{max(horas, 0)} h"
+
+
+def _calidad_lote(lote: m.Lote) -> str:
+    resultados = [e.calidad_aprobada for e in lote.etapas if e.calidad_aprobada is not None]
+    if any(r is False for r in resultados):
+        return "REPROBADA"
+    return "APROBADA" if resultados else "SIN_CONTROLES"
+
+
+def _linea_de_tiempo(db: Session, lote: m.Lote, publico: bool = False) -> list[dict]:
+    ahora = _utc_now()
+    ev: list[dict] = []
+    for e in sorted(lote.etapas, key=lambda x: x.id):
+        if e.completada_en:
+            estado = "COMPLETADA"
+        elif e.fecha_limite and _aware(e.fecha_limite) < ahora:
+            estado = "RETRASADA"
+        else:
+            estado = "PENDIENTE"
+        ev.append({"etapa_id": e.id, "fecha": e.completada_en or e.fecha, "fase": e.tipo or "PRODUCCION",
+                   "titulo": e.nombre, "estado": estado, "responsable": e.responsable,
+                   "calidad_aprobada": e.calidad_aprobada, "observaciones": e.observaciones,
+                   "fecha_limite": e.fecha_limite})
+
+    ingreso = db.scalar(select(m.MovimientoInventario).where(
+        m.MovimientoInventario.referencia_operacion == f"lote-{lote.id}-ingreso"))
+    if ingreso:
+        u = db.get(m.Usuario, ingreso.usuario_id) if ingreso.usuario_id else None
+        ev.append({"etapa_id": None, "fecha": ingreso.fecha, "fase": "ALMACENAMIENTO",
+                   "titulo": "Ingreso al inventario", "estado": "COMPLETADA",
+                   "responsable": u.nombre if u else None, "calidad_aprobada": None,
+                   "observaciones": None, "fecha_limite": None})
+
+    # Despachos: salidas de este lote que no fueron anuladas por un movimiento compensatorio
+    anulados = set(db.scalars(select(m.MovimientoInventario.compensa_a_id).where(
+        m.MovimientoInventario.lote_id == lote.id,
+        m.MovimientoInventario.compensa_a_id.is_not(None))))
+    salidas = db.scalars(select(m.MovimientoInventario).where(
+        m.MovimientoInventario.lote_id == lote.id, m.MovimientoInventario.tipo == m.SALIDA,
+        m.MovimientoInventario.pedido_id.is_not(None)).order_by(m.MovimientoInventario.id)).all()
+    por_pedido: dict[int, dict] = {}
+    for x in salidas:
+        if x.id in anulados:
+            continue
+        g = por_pedido.setdefault(x.pedido_id, {"fecha": x.fecha, "cantidad": 0, "usuario_id": x.usuario_id})
+        g["cantidad"] += x.cantidad
+    for pid, g in por_pedido.items():
+        ped = db.get(m.Pedido, pid)
+        u = db.get(m.Usuario, g["usuario_id"]) if g["usuario_id"] else None
+        ev.append({"etapa_id": None, "fecha": g["fecha"], "fase": "ENTREGA",
+                   "titulo": "Despacho" if publico else f"Despacho - pedido {ped.codigo}",
+                   "estado": "COMPLETADA", "responsable": u.nombre if u else None,
+                   "calidad_aprobada": None, "observaciones": None, "fecha_limite": None})
+        ent = next((x for x in ped.entregas if x.estado == "ENTREGADA" and x.fecha_entrega), None)
+        if ent:
+            ev.append({"etapa_id": None, "fecha": ent.fecha_entrega, "fase": "ENTREGA",
+                       "titulo": "Entrega confirmada", "estado": "COMPLETADA", "responsable": None,
+                       "calidad_aprobada": None, "observaciones": None, "fecha_limite": None})
+
+    ev.sort(key=lambda x: _aware(x["fecha"]) or ahora)
+    if publico:  # sin nombres de personas, observaciones internas ni ids
+        ev = [{k: e[k] for k in ("fecha", "fase", "titulo", "estado", "calidad_aprobada")} for e in ev]
+    return ev
+
+
+def _alertas_de_lote(lote: m.Lote, ahora: datetime) -> list[dict]:
+    out: list[dict] = []
+
+    def add(codigo, nivel, mensaje):
+        out.append({"lote_id": lote.id, "lote": lote.codigo, "producto": lote.producto.nombre,
+                    "codigo": codigo, "nivel": nivel, "mensaje": mensaje})
+
+    etapas = sorted(lote.etapas, key=lambda x: x.id)
+    for i, e in enumerate(etapas):
+        if e.completada_en is None and e.fecha_limite and _aware(e.fecha_limite) < ahora:
+            retraso = ahora - _aware(e.fecha_limite)
+            add("ETAPA_RETRASADA", "critica" if retraso >= timedelta(days=1) else "advertencia",
+                f"La etapa «{e.nombre}» venció hace {_hace(retraso)}")
+        if e.completada_en is not None and any(p.completada_en is None for p in etapas[:i]):
+            add("ETAPA_SALTADA", "advertencia", f"«{e.nombre}» se completó sin cerrar etapas anteriores")
+        if e.calidad_aprobada is False:
+            add("CALIDAD_REPROBADA", "critica", f"Control de calidad reprobado en «{e.nombre}»")
+
+    actividad = [_aware(lote.creado_en) or ahora] + [_aware(e.completada_en or e.fecha) for e in etapas]
+    sin_avance = ahora - max(actividad)
+    if sin_avance > timedelta(days=DIAS_SIN_AVANCE):
+        if not etapas:
+            add("SIN_ETAPAS", "advertencia", f"El lote lleva {_hace(sin_avance)} sin ninguna etapa registrada")
+        else:
+            add("SIN_AVANCE", "advertencia", f"El lote lleva {_hace(sin_avance)} sin actividad")
+    return out
+
+
+def _detalle_lote(db: Session, lote: m.Lote) -> dict:
+    ev = _linea_de_tiempo(db, lote)
+    etapas = [x for x in ev if x["etapa_id"] is not None]
+    return {"lote_id": lote.id, "codigo": lote.codigo, "producto": lote.producto.nombre,
+            "estado": lote.estado, "fecha_produccion": lote.fecha_produccion,
+            "cantidad": lote.cantidad_producida, "unidad": lote.producto.unidad,
+            "calidad": _calidad_lote(lote), "etapas_total": len(etapas),
+            "etapas_completadas": sum(1 for x in etapas if x["estado"] == "COMPLETADA"),
+            "alertas": _alertas_de_lote(lote, _utc_now()) if lote.estado == "EN_PROCESO" else [],
+            "linea_de_tiempo": ev}
+
+
+def _pdf_certificado(d: dict, url_qr: str) -> bytes:
+    """Certificado PDF con QR. Usa solo reportlab (Python puro, funciona en Vercel) y se arma
+    en memoria porque el disco de Vercel no es persistente. ZONA_HORARIA define la hora mostrada."""
+    from datetime import timezone as tzmod
+    from xml.sax.saxutils import escape
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    from reportlab.graphics.barcode.qr import QrCodeWidget
+    from reportlab.graphics.shapes import Drawing
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    try:
+        tz = ZoneInfo(os.getenv("ZONA_HORARIA", "UTC"))
+    except (ZoneInfoNotFoundError, ValueError):
+        tz = tzmod.utc
+    fases = {"PRODUCCION": "Producción", "ALMACENAMIENTO": "Almacenamiento", "ENTREGA": "Entrega"}
+    calidad_txt = {True: "Aprobada", False: "Reprobada", None: "Sin control"}
+    resultado_txt = {"APROBADA": ("Controles de calidad aprobados", "#1b7f3b"),
+                     "REPROBADA": ("Control de calidad reprobado", "#b42318"),
+                     "SIN_CONTROLES": ("Sin controles de calidad registrados", "#8a6100")}
+    azul = colors.HexColor("#14365d")
+
+    def fmt(dt):
+        if not dt:
+            return "-"
+        if isinstance(dt, datetime):
+            return _aware(dt).astimezone(tz).strftime("%d/%m/%Y %H:%M")
+        return dt.strftime("%d/%m/%Y")
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm,
+                            topMargin=16 * mm, bottomMargin=18 * mm, author="NOVATECH",
+                            title=f"Certificado de trazabilidad {d['codigo']}")
+    ss = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=ss["Title"], fontSize=20, leading=24, alignment=0, textColor=azul, spaceAfter=1)
+    sub = ParagraphStyle("sub", parent=ss["Normal"], fontSize=9, textColor=colors.grey)
+    h2 = ParagraphStyle("h2", parent=ss["Heading2"], fontSize=12, textColor=azul, spaceBefore=10, spaceAfter=4)
+    cel = ParagraphStyle("cel", parent=ss["Normal"], fontSize=8.5, leading=10.5)
+    cab = ParagraphStyle("cab", parent=cel, textColor=colors.white, fontName="Helvetica-Bold")
+    gris = ParagraphStyle("gris", parent=cel, textColor=colors.grey)
+    peq = ParagraphStyle("peq", parent=ss["Normal"], fontSize=7.5, leading=9, textColor=colors.grey)
+
+    def p(txt, st=cel):
+        return Paragraph(escape(str(txt)), st)
+
+    datos = [("Lote", d["codigo"]), ("Producto", d["producto"]),
+             ("Cantidad producida", f"{d['cantidad']} {d.get('unidad', '')}".strip()),
+             ("Fecha de producción", fmt(d["fecha_produccion"])), ("Estado del lote", d["estado"])]
+    tabla_datos = Table([[p(k, gris), p(v)] for k, v in datos], colWidths=[38 * mm, 78 * mm])
+    tabla_datos.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                     ("BOTTOMPADDING", (0, 0), (-1, -1), 3), ("TOPPADDING", (0, 0), (-1, -1), 3)]))
+
+    qr = QrCodeWidget(url_qr, barLevel="M")
+    x0, y0, x1, y1 = qr.getBounds()
+    lado = 34 * mm
+    dibujo = Drawing(lado, lado, transform=[lado / (x1 - x0), 0, 0, lado / (y1 - y0), 0, 0])
+    dibujo.add(qr)
+    cabecera = Table([[tabla_datos, [dibujo, Paragraph("Escanee para verificar este lote", peq)]]],
+                     colWidths=[120 * mm, 54 * mm])
+    cabecera.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                  ("BOX", (0, 0), (-1, -1), 0.6, colors.lightgrey),
+                                  ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                                  ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
+
+    texto, color = resultado_txt.get(d["calidad"], resultado_txt["SIN_CONTROLES"])
+    resultado = Paragraph(f'<font color="{color}"><b>{escape(texto)}</b></font>',
+                          ParagraphStyle("res", parent=cel, fontSize=10, spaceBefore=8))
+
+    filas = [[Paragraph(t, cab) for t in ("Fecha", "Fase", "Evento", "Responsable", "Calidad")]]
+    for e in d["eventos"]:
+        evento = e["titulo"] + (" (pendiente)" if e.get("estado") in ("PENDIENTE", "RETRASADA") else "")
+        filas.append([p(fmt(e["fecha"])), p(fases.get(e["fase"], e["fase"])), p(evento),
+                      p(e.get("responsable") or "-"), p(calidad_txt.get(e.get("calidad_aprobada"), "-"))])
+    historial = Table(filas, colWidths=[30 * mm, 28 * mm, 50 * mm, 34 * mm, 32 * mm], repeatRows=1)
+    historial.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), azul),
+                                   ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f3f6fa")]),
+                                   ("GRID", (0, 0), (-1, -1), 0.3, colors.lightgrey),
+                                   ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+
+    emision = f"Emitido el {fmt(_utc_now())}" + (f" por {d['emitido_por']}" if d.get("emitido_por") else "")
+    contenido = [Paragraph("Certificado de trazabilidad", h1), Paragraph("NOVATECH - Trazabilidad inteligente", sub),
+                 Spacer(1, 8), cabecera, resultado, Paragraph("Historial del lote", h2), historial, Spacer(1, 10),
+                 Paragraph(escape(emision), peq), Paragraph("Verifique la autenticidad en: " + escape(url_qr), peq)]
+
+    def pie(canvas, _doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(colors.grey)
+        canvas.drawString(18 * mm, 10 * mm, f"Lote {d['codigo']} - certificado generado automáticamente")
+        canvas.drawRightString(A4[0] - 18 * mm, 10 * mm, f"Página {canvas.getPageNumber()}")
+        canvas.restoreState()
+
+    doc.build(contenido, onFirstPage=pie, onLaterPages=pie)
+    return buf.getvalue()
+
+
+# Página pública que abre quien escanea el QR (va dentro de /api para que Vercel la enrute al backend)
+VERIFICAR_HTML = r"""<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verificación de lote - NOVATECH</title>
+<style>
+:root{--bg:#f4f6f9;--card:#fff;--txt:#16202c;--mut:#667085;--brd:#e2e6ec;--azul:#14365d;--ok:#1b7f3b;--mal:#b42318;--aviso:#8a6100}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1620;--card:#18212d;--txt:#e8edf3;--mut:#9aa7b6;--brd:#2a3645;--azul:#8fb8e8;--ok:#4cc27a;--mal:#ff8a80;--aviso:#e6b84d}}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--txt);padding:16px}
+main{max-width:560px;margin:0 auto}h1{font-size:1.15rem;color:var(--azul);margin:8px 0 14px}
+.card{background:var(--card);border:1px solid var(--brd);border-radius:12px;padding:16px;margin-bottom:14px}
+dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:6px 14px}dt{color:var(--mut)}dd{margin:0;font-weight:600}
+.sello{font-weight:700;margin-top:12px}.APROBADA{color:var(--ok)}.REPROBADA{color:var(--mal)}.SIN_CONTROLES{color:var(--aviso)}
+ol{list-style:none;margin:0;padding:0}li{padding:10px 0 10px 16px;border-left:3px solid var(--brd);margin-left:6px;position:relative}
+li::before{content:"";position:absolute;left:-7px;top:15px;width:11px;height:11px;border-radius:50%;background:var(--azul)}
+li.PENDIENTE::before,li.RETRASADA::before{background:var(--card);border:2px solid var(--mut)}
+li small{display:block;color:var(--mut)}#error{color:var(--mal);font-weight:600}
+</style></head><body><main><h1>Verificación de lote</h1><div id="contenido"><p>Cargando…</p></div></main>
+<script>
+const FASES={PRODUCCION:"Producción",ALMACENAMIENTO:"Almacenamiento",ENTREGA:"Entrega"};
+const CALIDAD={APROBADA:"Controles de calidad aprobados",REPROBADA:"Control de calidad reprobado",SIN_CONTROLES:"Sin controles de calidad registrados"};
+const CAL_ETAPA={true:"calidad aprobada",false:"calidad reprobada"};
+function el(tag,props={},...hijos){const e=document.createElement(tag);Object.assign(e,props);hijos.forEach(h=>e.append(h));return e}
+function fecha(iso){const d=new Date(iso);return isNaN(d)?"":d.toLocaleString("es",{dateStyle:"medium",timeStyle:iso.length>10?"short":undefined})}
+async function cargar(){
+  const cont=document.getElementById("contenido");const token=new URLSearchParams(location.search).get("t");cont.replaceChildren();
+  if(!token){cont.append(el("p",{id:"error",textContent:"Falta el código del lote."}));return}
+  try{
+    const resp=await fetch("/api/trazabilidad/"+encodeURIComponent(token));const json=await resp.json();
+    if(!resp.ok)throw new Error(json.error||"No se pudo consultar el lote");const d=json.data;
+    const datos=el("dl");
+    [["Lote",d.lote],["Producto",d.producto],["Producción",fecha(d.fecha_produccion)],["Estado",d.estado]].forEach(([k,v])=>datos.append(el("dt",{textContent:k}),el("dd",{textContent:v})));
+    cont.append(el("div",{className:"card"},datos,el("div",{className:"sello "+d.calidad,textContent:CALIDAD[d.calidad]||""})));
+    const lista=el("ol");
+    (d.historial||[]).forEach(ev=>{
+      const detalle=[FASES[ev.fase]||ev.fase,fecha(ev.fecha),ev.estado==="PENDIENTE"?"pendiente":ev.estado==="RETRASADA"?"retrasada":"",CAL_ETAPA[ev.calidad_aprobada]||""].filter(Boolean).join(" · ");
+      lista.append(el("li",{className:ev.estado},el("strong",{textContent:ev.titulo}),el("small",{textContent:detalle})));
+    });
+    cont.append(el("div",{className:"card"},el("strong",{textContent:"Historial"}),lista));
+  }catch(e){cont.append(el("p",{id:"error",textContent:e.message}))}
+}
+cargar();
+</script></body></html>"""
+
+
 @tra.get("/lotes")
 def listar_lotes(q: str | None = None, estado: str | None = None, producto_id: int | None = None,
                  db: Session = Depends(get_db), _=LEE):
@@ -346,14 +655,60 @@ def ver_lote(lote_id: int, db: Session = Depends(get_db), _=LEE):
     return {"ok": True, "data": s.LoteOut.model_validate(_lote_o_404(db, lote_id))}
 
 
+@tra.get("/lotes/{lote_id}/trazabilidad")
+def trazabilidad_lote(lote_id: int, db: Session = Depends(get_db), _=LEE):
+    """Detalle completo: línea de tiempo (etapas, almacenamiento, despachos) y alertas del lote."""
+    return {"ok": True, "data": _detalle_lote(db, _lote_o_404(db, lote_id))}
+
+
 @tra.post("/lotes/{lote_id}/etapas", status_code=201)
-def agregar_etapa(lote_id: int, d: s.EtapaIn, db: Session = Depends(get_db), _=ESCRIBE):
+def agregar_etapa(lote_id: int, d: EtapaPlanIn, db: Session = Depends(get_db), _=ESCRIBE):
     lote = _lote_o_404(db, lote_id)
     if lote.estado != "EN_PROCESO":
         raise HTTPException(400, f"No se pueden agregar etapas a un lote {lote.estado}")
-    lote.etapas.append(m.EtapaProduccion(**d.model_dump(exclude_none=True)))
+    etapa = m.EtapaProduccion(**d.model_dump(exclude={"completada", "fecha"}, exclude_none=True))
+    if d.fecha:
+        etapa.fecha = d.fecha
+    if d.completada:  # sin completada=false se comporta como antes: la etapa ya ocurrió
+        etapa.completada_en = d.fecha or _utc_now()
+    lote.etapas.append(etapa)
     _commit(db)
-    return {"ok": True, "data": s.LoteOut.model_validate(lote)}
+    return {"ok": True, "data": _detalle_lote(db, lote)}
+
+
+def _etapa_editable(db: Session, etapa_id: int) -> m.EtapaProduccion:
+    e = db.get(m.EtapaProduccion, etapa_id)
+    if not e:
+        raise HTTPException(404, "La etapa no existe")
+    if e.lote.estado != "EN_PROCESO":
+        raise HTTPException(400, f"El lote está {e.lote.estado}: su historial ya no se modifica")
+    return e
+
+
+@tra.post("/etapas/{etapa_id}/completar")
+def completar_etapa(etapa_id: int, d: CompletarEtapaIn, db: Session = Depends(get_db), _=ESCRIBE):
+    e = _etapa_editable(db, etapa_id)
+    if e.completada_en:
+        raise HTTPException(409, "La etapa ya estaba completada")
+    e.completada_en = _utc_now()
+    if d.responsable:
+        e.responsable = d.responsable
+    if d.observaciones:
+        e.observaciones = d.observaciones
+    if d.calidad_aprobada is not None:
+        e.calidad_aprobada = d.calidad_aprobada
+    _commit(db)
+    return {"ok": True, "data": _detalle_lote(db, e.lote)}
+
+
+@tra.post("/etapas/{etapa_id}/calidad")
+def registrar_calidad(etapa_id: int, d: CalidadEtapaIn, db: Session = Depends(get_db), _=ESCRIBE):
+    e = _etapa_editable(db, etapa_id)
+    e.calidad_aprobada = d.aprobada
+    if d.observaciones:
+        e.observaciones = d.observaciones
+    _commit(db)
+    return {"ok": True, "data": _detalle_lote(db, e.lote)}
 
 
 @tra.post("/lotes/{lote_id}/estado")
@@ -370,21 +725,57 @@ def cambiar_estado_lote(lote_id: int, d: s.LoteEstadoIn,
     return {"ok": True, "data": s.LoteOut.model_validate(lote)}
 
 
+# Las alertas se calculan al consultar (no hace falta un proceso permanente en Vercel).
+# Esta ruta debe ir ANTES de /trazabilidad/{qr_token} para que "alertas" no se tome como token.
+@tra.get("/trazabilidad/alertas")
+def alertas_trazabilidad(db: Session = Depends(get_db), _=LEE):
+    ahora = _utc_now()
+    lotes = db.scalars(select(m.Lote).where(m.Lote.estado == "EN_PROCESO")
+                       .options(selectinload(m.Lote.etapas), selectinload(m.Lote.producto))
+                       .order_by(m.Lote.id.desc()).limit(300)).all()
+    data = [a for l in lotes for a in _alertas_de_lote(l, ahora)]
+    data.sort(key=lambda a: (a["nivel"] != "critica", a["lote"]))
+    return {"ok": True, "dias_sin_avance": DIAS_SIN_AVANCE,
+            "resumen": {"criticas": sum(a["nivel"] == "critica" for a in data),
+                        "advertencias": sum(a["nivel"] == "advertencia" for a in data)},
+            "data": data}
+
+
 @tra.get("/trazabilidad/{qr_token}")
 def consulta_publica(qr_token: str, db: Session = Depends(get_db)):
     """Pública (la abre quien escanea el QR). Solo expone datos no sensibles."""
     lote = db.scalar(select(m.Lote).where(m.Lote.qr_token == qr_token))
     if not lote:
         raise HTTPException(404, "Código no válido")
-    prod = db.get(m.Producto, lote.producto_id)
     return {"ok": True, "data": {
-        "lote": lote.codigo,
-        "producto": prod.nombre if prod else None,
-        "fecha_produccion": lote.fecha_produccion.isoformat(),
-        "estado": lote.estado,
+        "lote": lote.codigo, "producto": lote.producto.nombre,
+        "fecha_produccion": lote.fecha_produccion.isoformat(), "estado": lote.estado,
+        "calidad": _calidad_lote(lote),
         "etapas": [{"nombre": e.nombre, "fecha": e.fecha.isoformat(),
-                    "calidad_aprobada": e.calidad_aprobada} for e in lote.etapas],
-    }}
+                    "calidad_aprobada": e.calidad_aprobada} for e in lote.etapas],  # formato anterior
+        "historial": _linea_de_tiempo(db, lote, publico=True)}}
+
+
+@tra.get("/verificar", response_class=HTMLResponse)
+def pagina_verificar():
+    return HTMLResponse(VERIFICAR_HTML)
+
+
+@tra.get("/lotes/{lote_id}/certificado")
+def certificado_lote(lote_id: int, request: Request, db: Session = Depends(get_db), u=LEE):
+    lote = _lote_o_404(db, lote_id)
+    if lote.estado != "FINALIZADO":
+        raise HTTPException(409, "Solo se emite certificado de lotes FINALIZADOS")
+    det = _detalle_lote(db, lote)
+    base = (os.getenv("PUBLIC_BASE_URL") or str(request.base_url)).rstrip("/")  # en Vercel: fijar PUBLIC_BASE_URL
+    pdf = _pdf_certificado({
+        "codigo": lote.codigo, "producto": det["producto"], "cantidad": format(det["cantidad"].normalize(), "f"),
+        "unidad": det["unidad"], "fecha_produccion": lote.fecha_produccion, "estado": lote.estado,
+        "calidad": det["calidad"], "eventos": det["linea_de_tiempo"], "emitido_por": u.nombre},
+        f"{base}/api/verificar?t={lote.qr_token}")
+    nombre = re.sub(r"[^A-Za-z0-9_.-]", "_", lote.codigo)
+    return StreamingResponse(BytesIO(pdf), media_type="application/pdf",
+                             headers={"Content-Disposition": f'inline; filename="certificado-{nombre}.pdf"'})
 
 
 # ───────────── Logística ─────────────
