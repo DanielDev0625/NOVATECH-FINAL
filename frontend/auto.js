@@ -43,5 +43,5 @@
 
   NAV.push(["aut", "Automatización"]);
   VISTAS.aut = vAut;
-  if (me) $("#nav").innerHTML = NAV.map(([k, t]) => `<button data-v="${k}">${t}</button>`).join("");
+  if (me) $("#nav").innerHTML = NAV.map(([k, t]) => `<button data-v="${k}">${ICO[k] || ""}<span>${t}</span></button>`).join("");
 })();
