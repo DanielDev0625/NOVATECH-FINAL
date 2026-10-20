@@ -194,7 +194,7 @@ async function go(v) {
       $("#vista").innerHTML = `
         <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px;">
           <div>
-            <h2 style="font-size: 26px; margin-bottom: 4px;">Hola, ${esc(me.nombre)} 👋</h2>
+            <h2 style="font-size: 26px; margin-bottom: 4px;">Hola, ${esc(me.nombre)} </h2>
             <p class="mut">Aquí tienes un resumen de la actividad de tu inventario.</p>
           </div>
           <div class="mut" style="text-align: right; font-size: 13px; font-weight: 600;">
@@ -266,7 +266,7 @@ async function go(v) {
 
       $("#vista").innerHTML = `
         <div class="bar">
-          ${puede() ? bt("ntrans", "", "+ Nuevo Transportista") + bt("nveh", "", "+ Nuevo Vehículo") + bt("nent", "", "+ Nueva Entrega") + bt("auto_ruta", "", "⚡ Auto-Asignar Ruta", "btn") : ""}
+          ${puede() ? bt("ntrans", "", "+ Nuevo Transportista") + bt("nveh", "", "+ Nuevo Vehículo") + bt("nent", "", "+ Nueva Entrega") + bt("auto_ruta", "", " Auto-Asignar Ruta", "btn") : ""}
         </div>
         <h3 style="margin-top: 20px; margin-bottom: 12px;">Entregas Programadas y En Ruta</h3>
         ${tabla([
