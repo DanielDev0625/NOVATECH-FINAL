@@ -3,19 +3,29 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NOVATECH</title>
+<title>NOVATECH · Gestión inteligente para PyMEs</title>
+<link rel="icon" type="image/png" href="/img/Suva-claro.png">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <div id="login" class="login hidden"></div>
 <div id="app" class="app hidden">
   <aside id="side">
-    <div class="brand">NOVATECH</div>
+    <div class="logo" id="logo">
+  <img src="img/Suva-claro.png" alt="Logo Novatech" />
+</div>
     <nav id="nav"></nav>
-    <button class="btn ghost" id="salir">Cerrar sesión</button>
+    <div class="side-foot">
+      <button class="out" id="salir"></button>
+      <p>Optimiza hoy,<br>crece mañana.</p>
+    </div>
   </aside>
   <div class="main">
-    <header><button class="btn ghost" id="menu">☰</button><h1 id="titulo"></h1><span id="user" class="mut"></span></header>
+    <header>
+      <button class="btn ghost" id="menu">☰</button>
+      <h1 id="titulo"></h1>
+      <div id="user" class="usr"></div>
+    </header>
     <main id="vista"></main>
   </div>
 </div>
