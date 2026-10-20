@@ -10,49 +10,40 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.database import Base
 
-
 def _ahora() -> datetime:
     return datetime.now(timezone.utc)
 
+# Alias para compatibilidad con código existente
+def _utc_now() -> datetime:
+    return _ahora()
 
 class ReglaNegocioError(Exception):
-    """Violación de una regla de negocio (el backend la convierte en HTTP 4xx)."""
+    pass
 
-
-# ───────────────────────── HERENCIA: clase base común ─────────────────────────
 class ModeloBase(Base):
-    """Base abstracta: id y auditoría de tiempos para todas las entidades."""
     __abstract__ = True
     id: Mapped[int] = mapped_column(primary_key=True)
     creado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_ahora)
-    actualizado_en: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_ahora, onupdate=_ahora
-    )
+    actualizado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_ahora, onupdate=_ahora)
 
-
-# ───────────────────────────── USUARIOS ─────────────────────────────
 class Usuario(ModeloBase):
     __tablename__ = "usuarios"
     email: Mapped[str] = mapped_column(String(160), unique=True, index=True)
     nombre: Mapped[str] = mapped_column(String(120))
     password_hash: Mapped[str] = mapped_column(String(255))
-    rol: Mapped[str] = mapped_column(String(20), default="operador")  # admin | operador | consulta
+    rol: Mapped[str] = mapped_column(String(20), default="operador")
     activo: Mapped[bool] = mapped_column(Boolean, default=True)
 
-
-# ───────────────────────────── INVENTARIO ─────────────────────────────
 class Categoria(ModeloBase):
     __tablename__ = "categorias"
     nombre: Mapped[str] = mapped_column(String(80), unique=True)
     productos: Mapped[list["Producto"]] = relationship(back_populates="categoria")
-
 
 ENTRADA, SALIDA = "ENTRADA", "SALIDA"
 AJUSTE_ENTRADA, AJUSTE_SALIDA = "AJUSTE_ENTRADA", "AJUSTE_SALIDA"
 TIPOS_QUE_SUMAN = {ENTRADA, AJUSTE_ENTRADA}
 TIPOS_QUE_RESTAN = {SALIDA, AJUSTE_SALIDA}
 TIPOS_MOVIMIENTO = TIPOS_QUE_SUMAN | TIPOS_QUE_RESTAN
-
 
 class Producto(ModeloBase):
     __tablename__ = "productos"
@@ -63,8 +54,6 @@ class Producto(ModeloBase):
     unidad: Mapped[str] = mapped_column(String(20), default="unidad")
     stock_minimo: Mapped[Decimal] = mapped_column(Numeric(14, 3), default=0)
     activo: Mapped[bool] = mapped_column(Boolean, default=True)
-
-    # ENCAPSULAMIENTO: el stock es "privado"; solo cambia vía aplicar_movimiento()
     _stock: Mapped[Decimal] = mapped_column("stock_actual", Numeric(14, 3), nullable=False)
 
     categoria: Mapped["Categoria | None"] = relationship(back_populates="productos")
@@ -89,7 +78,6 @@ class Producto(ModeloBase):
         return self._stock <= (self.stock_minimo or 0)
 
     def aplicar_movimiento(self, tipo: str, cantidad: Decimal) -> Decimal:
-        """Único punto de cambio del stock. Devuelve el stock resultante."""
         cantidad = Decimal(cantidad)
         if tipo not in TIPOS_MOVIMIENTO:
             raise ReglaNegocioError(f"Tipo de movimiento inválido: {tipo}")
@@ -99,15 +87,11 @@ class Producto(ModeloBase):
             raise ReglaNegocioError("El producto está inactivo")
         nuevo = self._stock + cantidad if tipo in TIPOS_QUE_SUMAN else self._stock - cantidad
         if nuevo < 0:
-            raise ReglaNegocioError(
-                f"Stock insuficiente: disponible {self._stock}, solicitado {cantidad}"
-            )
+            raise ReglaNegocioError(f"Stock insuficiente: disponible {self._stock}, solicitado {cantidad}")
         self._stock = nuevo
         return nuevo
 
-
 class MovimientoInventario(ModeloBase):
-    """Historial inmutable. Un error se corrige con un movimiento compensatorio."""
     __tablename__ = "movimientos_inventario"
     producto_id: Mapped[int] = mapped_column(ForeignKey("productos.id"), index=True)
     lote_id: Mapped[int | None] = mapped_column(ForeignKey("lotes.id"))
@@ -116,7 +100,6 @@ class MovimientoInventario(ModeloBase):
     tipo: Mapped[str] = mapped_column(String(20))
     cantidad: Mapped[Decimal] = mapped_column(Numeric(14, 3))
     stock_resultante: Mapped[Decimal] = mapped_column(Numeric(14, 3))
-    # Idempotencia: el cliente envía una clave única por operación; un reintento no duplica.
     referencia_operacion: Mapped[str] = mapped_column(String(80), unique=True)
     compensa_a_id: Mapped[int | None] = mapped_column(ForeignKey("movimientos_inventario.id"), unique=True)
     observacion: Mapped[str | None] = mapped_column(Text)
@@ -124,17 +107,13 @@ class MovimientoInventario(ModeloBase):
 
     producto: Mapped["Producto"] = relationship(back_populates="movimientos")
 
-    __table_args__ = (CheckConstraint("cantidad > 0", name="ck_movimiento_cantidad_positiva"),)
-
-
-# ───────────────────────────── TRAZABILIDAD ─────────────────────────────
 class Lote(ModeloBase):
     __tablename__ = "lotes"
     codigo: Mapped[str] = mapped_column(String(40), unique=True, index=True)
     producto_id: Mapped[int] = mapped_column(ForeignKey("productos.id"), index=True)
     fecha_produccion: Mapped[date] = mapped_column(Date, default=date.today)
     cantidad_producida: Mapped[Decimal] = mapped_column(Numeric(14, 3))
-    estado: Mapped[str] = mapped_column(String(20), default="EN_PROCESO")  # EN_PROCESO | FINALIZADO | RECHAZADO
+    estado: Mapped[str] = mapped_column(String(20), default="EN_PROCESO")
     qr_token: Mapped[str] = mapped_column(String(64), unique=True, default=lambda: secrets.token_urlsafe(24))
 
     producto: Mapped["Producto"] = relationship(back_populates="lotes")
@@ -142,8 +121,6 @@ class Lote(ModeloBase):
         back_populates="lote", order_by="EtapaProduccion.fecha", cascade="all, delete-orphan"
     )
 
-    __table_args__ = (CheckConstraint("cantidad_producida > 0", name="ck_lote_cantidad_positiva"),)
-        # ENCAPSULAMIENTO: el estado solo cambia por transiciones válidas
     TRANSICIONES = {
         "EN_PROCESO": {"FINALIZADO", "RECHAZADO"},
         "FINALIZADO": set(),
@@ -163,7 +140,6 @@ class Lote(ModeloBase):
             raise ReglaNegocioError("No se puede finalizar: hay etapas sin completar")
         self.estado = nuevo
 
-
 class EtapaProduccion(ModeloBase):
     __tablename__ = "etapas_produccion"
     lote_id: Mapped[int] = mapped_column(ForeignKey("lotes.id"), index=True)
@@ -171,24 +147,24 @@ class EtapaProduccion(ModeloBase):
     fecha: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_ahora)
     responsable: Mapped[str] = mapped_column(String(120))
     observaciones: Mapped[str | None] = mapped_column(Text)
-    calidad_aprobada: Mapped[bool | None] = mapped_column(Boolean)  # None = sin control aún
+    calidad_aprobada: Mapped[bool | None] = mapped_column(Boolean)
     tipo: Mapped[str] = mapped_column(String(20), default="PRODUCCION", server_default="PRODUCCION")
-    # PRODUCCION | ALMACENAMIENTO | ENTREGA
     fecha_limite: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    completada_en: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # None = pendiente
+    completada_en: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     lote: Mapped["Lote"] = relationship(back_populates="etapas")
 
-
-# ───────────────────────────── LOGÍSTICA ─────────────────────────────
 class Transportista(ModeloBase):
     __tablename__ = "transportistas"
     nombre: Mapped[str] = mapped_column(String(120))
     documento: Mapped[str] = mapped_column(String(30), unique=True)
     telefono: Mapped[str | None] = mapped_column(String(30))
+    costo_por_km: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=Decimal("0.00"))
+    valoracion: Mapped[Decimal] = mapped_column(Numeric(3, 2), default=Decimal("5.00"))
     activo: Mapped[bool] = mapped_column(Boolean, default=True)
-    vehiculos: Mapped[list["Vehiculo"]] = relationship(back_populates="transportista")
 
+    vehiculos: Mapped[list["Vehiculo"]] = relationship(back_populates="transportista")
+    entregas: Mapped[list["Entrega"]] = relationship(back_populates="transportista")
 
 class Vehiculo(ModeloBase):
     __tablename__ = "vehiculos"
@@ -197,8 +173,9 @@ class Vehiculo(ModeloBase):
     tipo: Mapped[str] = mapped_column(String(40), default="camión")
     capacidad_kg: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
     transportista_id: Mapped[int | None] = mapped_column(ForeignKey("transportistas.id"))
-    transportista: Mapped["Transportista | None"] = relationship(back_populates="vehiculos")
+    activo: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    transportista: Mapped["Transportista | None"] = relationship(back_populates="vehiculos")
 
 class Pedido(ModeloBase):
     __tablename__ = "pedidos"
@@ -211,7 +188,6 @@ class Pedido(ModeloBase):
     detalles: Mapped[list["DetallePedido"]] = relationship(back_populates="pedido", cascade="all, delete-orphan")
     entregas: Mapped[list["Entrega"]] = relationship(back_populates="pedido")
 
-    # ENCAPSULAMIENTO: el estado solo avanza por transiciones válidas
     TRANSICIONES = {
         "PENDIENTE": {"PREPARANDO", "CANCELADO"},
         "PREPARANDO": {"DESPACHADO", "CANCELADO"},
@@ -225,18 +201,15 @@ class Pedido(ModeloBase):
             raise ReglaNegocioError(f"No se puede pasar de {self.estado} a {nuevo}")
         self.estado = nuevo
 
-
 class DetallePedido(ModeloBase):
     __tablename__ = "detalles_pedido"
     pedido_id: Mapped[int] = mapped_column(ForeignKey("pedidos.id"), index=True)
     producto_id: Mapped[int] = mapped_column(ForeignKey("productos.id"))
     lote_id: Mapped[int | None] = mapped_column(ForeignKey("lotes.id"))
     cantidad: Mapped[Decimal] = mapped_column(Numeric(14, 3))
+    
     pedido: Mapped["Pedido"] = relationship(back_populates="detalles")
     producto: Mapped["Producto"] = relationship()
-
-    __table_args__ = (CheckConstraint("cantidad > 0", name="ck_detalle_cantidad_positiva"),)
-
 
 class Entrega(ModeloBase):
     __tablename__ = "entregas"
@@ -245,12 +218,18 @@ class Entrega(ModeloBase):
     vehiculo_id: Mapped[int | None] = mapped_column(ForeignKey("vehiculos.id"))
     origen: Mapped[str | None] = mapped_column(String(120))
     destino: Mapped[str | None] = mapped_column(String(120))
-    estado: Mapped[str] = mapped_column(String(20), default="PROGRAMADA")  # PROGRAMADA | EN_RUTA | ENTREGADA | FALLIDA
+    distancia_km: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=Decimal("0.00"))
+    tarifa: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0.00"))
+    comision: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0.00"))
+    estado: Mapped[str] = mapped_column(String(20), default="PROGRAMADA")
     fecha_despacho: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     fecha_entrega: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     observaciones: Mapped[str | None] = mapped_column(Text)
+
     pedido: Mapped["Pedido"] = relationship(back_populates="entregas")
-        # ENCAPSULAMIENTO: el estado solo cambia por transiciones válidas
+    transportista: Mapped["Transportista | None"] = relationship(back_populates="entregas")
+    vehiculo: Mapped["Vehiculo | None"] = relationship()
+
     TRANSICIONES = {
         "PROGRAMADA": {"EN_RUTA"},
         "EN_RUTA": {"ENTREGADA"},
@@ -262,10 +241,7 @@ class Entrega(ModeloBase):
             raise ReglaNegocioError(f"No se puede pasar de {self.estado} a {nuevo}")
         self.estado = nuevo
 
-
-# ───────────────────── EFICIENCIA ENERGÉTICA (POLIMORFISMO) ─────────────────────
 class FuenteEmision(ABC):
-    """Interfaz común: cada fuente valida su cantidad y calcula sus emisiones a su manera."""
     codigo: str
     unidad: str
 
@@ -275,44 +251,34 @@ class FuenteEmision(ABC):
     @abstractmethod
     def calcular_emisiones_kg(self, cantidad: Decimal, factor: Decimal | None) -> Decimal | None: ...
 
-
 class ElectricidadRed(FuenteEmision):
     codigo, unidad = "ELECTRICIDAD", "kWh"
-
     def validar_cantidad(self, cantidad):
         if cantidad <= 0:
             raise ReglaNegocioError("El consumo eléctrico debe ser mayor que 0 kWh")
-
     def calcular_emisiones_kg(self, cantidad, factor):
-        return None if factor is None else cantidad * factor  # kgCO2/kWh
-
+        return None if factor is None else cantidad * factor
 
 class Diesel(FuenteEmision):
     codigo, unidad = "DIESEL", "litros"
-
     def validar_cantidad(self, cantidad):
         if cantidad <= 0:
             raise ReglaNegocioError("Los litros de diésel deben ser mayores que 0")
-
     def calcular_emisiones_kg(self, cantidad, factor):
-        return None if factor is None else cantidad * factor  # kgCO2/litro
+        return None if factor is None else cantidad * factor
 
-
-class Gasolina(Diesel):  # herencia: reutiliza validación y cálculo, cambia identidad
+class Gasolina(Diesel):
     codigo, unidad = "GASOLINA", "litros"
-
 
 FUENTES: dict[str, FuenteEmision] = {f.codigo: f for f in (ElectricidadRed(), Diesel(), Gasolina())}
 
-
 class RegistroEnergetico(ModeloBase):
-    """Consumo de una máquina/proceso. El factor de emisión lo aporta el usuario (no se inventa)."""
     __tablename__ = "registros_energeticos"
-    fuente_nombre: Mapped[str] = mapped_column(String(120), index=True)  # máquina o proceso
+    fuente_nombre: Mapped[str] = mapped_column(String(120), index=True)
     tipo_fuente: Mapped[str] = mapped_column(String(20), default="ELECTRICIDAD")
     fecha: Mapped[date] = mapped_column(Date, index=True)
-    cantidad: Mapped[Decimal] = mapped_column(Numeric(14, 3))        # kWh o litros según la fuente
-    tarifa_unitaria: Mapped[Decimal] = mapped_column(Numeric(14, 4)) # costo por kWh o por litro
+    cantidad: Mapped[Decimal] = mapped_column(Numeric(14, 3))
+    tarifa_unitaria: Mapped[Decimal] = mapped_column(Numeric(14, 4))
     factor_emision: Mapped[Decimal | None] = mapped_column(Numeric(10, 5))
 
     @property
