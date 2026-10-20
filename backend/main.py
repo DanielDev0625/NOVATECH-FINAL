@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from backend import automatizacion as auto
 from backend import models as m
 from backend import schemas as s
 from backend.database import engine, get_db, init_db
@@ -579,10 +580,13 @@ def despachar_entrega(entrega_id: int, db: Session = Depends(get_db), u=ESCRIBE)
     # Se bloquean los productos en orden de id para evitar bloqueos cruzados
     prods = {i: _producto_bloqueado(db, i) for i in sorted({x.producto_id for x in ped.detalles})}
     for det in ped.detalles:
-        _registrar(db, prods[det.producto_id], m.SALIDA, det.cantidad,
-                   f"pedido-{ped.id}-det-{det.id}-salida", u,
-                   lote_id=det.lote_id, pedido_id=ped.id,
-                   observacion=f"Despacho del pedido {ped.codigo}")
+        partes = ([(det.lote_id, det.cantidad)] if det.lote_id
+                  else auto.repartir_por_lotes(db, det.producto_id, det.cantidad))
+        for i, (lote_id, cant) in enumerate(partes):
+            ref = f"pedido-{ped.id}-det-{det.id}-salida" + (f"-p{i}" if i else "")
+            _registrar(db, prods[det.producto_id], m.SALIDA, cant, ref, u,
+                       lote_id=lote_id, pedido_id=ped.id,
+                       observacion=f"Despacho del pedido {ped.codigo}")
     e.fecha_despacho = datetime.now(timezone.utc)
     _commit(db)
     return {"ok": True, "data": s.EntregaOut.model_validate(e)}
@@ -784,6 +788,7 @@ app.include_router(inv)
 app.include_router(tra)
 app.include_router(log)
 app.include_router(ene)
+app.include_router(auto.crear_router(LEE, ESCRIBE, ADMIN, _commit))
 
 # Solo para desarrollo local: sirve el frontend. En Vercel lo sirve el CDN.
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
