@@ -1,7 +1,18 @@
 import os
 import sys
+import traceback
 
-# La raíz del proyecto debe estar en el path para importar el paquete "backend"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.main import app  # noqa: E402,F401  (Vercel busca la variable "app")
+try:
+    from backend.main import app  # noqa: F401
+except Exception:
+    from fastapi import FastAPI
+    from fastapi.responses import PlainTextResponse
+
+    _tb = traceback.format_exc()
+    app = FastAPI()
+
+    @app.get("/{path:path}")
+    def _error(path: str):
+        return PlainTextResponse(_tb, status_code=500)
