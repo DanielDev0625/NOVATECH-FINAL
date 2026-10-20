@@ -198,7 +198,7 @@ async function go(v) {
             <p class="mut">Aquí tienes un resumen de la actividad de tu inventario.</p>
           </div>
           <div class="mut" style="text-align: right; font-size: 13px; font-weight: 600;">
-            📅 ${fechaActual}
+            ${fechaActual}
           </div>
         </div>
 
