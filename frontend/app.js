@@ -84,7 +84,7 @@ function pintaLogin() {
   $("#login").innerHTML = `
     <div class="login-left">
       <div class="brand-header">
-        <img src="/img/logo-novatech.png" alt="NOVATECH" style="height: 52px; object-fit: contain;">
+        <img src="/img/logo-Novatech.png" alt="NOVATECH" style="height: 52px; object-fit: contain;">
         <div class="brand-slogan">Innovación · Control · Eficiencia</div>
       </div>
       <div>
@@ -165,7 +165,7 @@ async function iniciar() {
   
   $("#side").innerHTML = `
     <div style="padding: 10px 4px; display: flex; align-items: center; justify-content: flex-start;">
-      <img src="/img/logo-novatech.png" alt="NOVATECH" style="height: 42px; object-fit: contain;">
+      <img src="/img/logo-Novatech.png" alt="NOVATECH" style="height: 42px; object-fit: contain;">
     </div>
     <nav id="nav"></nav>
     <div class="side-foot">
